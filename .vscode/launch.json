@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [        
+        {
+            "name": "Photos Sync",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "amazon_photos.photos_sync",
+            "args": [
+                "amazon_photos.photos_sync:main",
+            ],
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+        }
+    ]
+}

@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "amazon-photos"
+version = "0.0.97"
+description = "Amazon Photos API"
+authors = [
+    { name = "Trevor Hobenshield", email = "trevorhobenshield@gmail.com" }
+]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10.10"
+keywords = ["amazon", "photos", "api", "async", "search", "automation"]
+classifiers = [
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Operating System :: Unix",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "psutil",
+    "nest-asyncio",
+    "tqdm",
+    "uvloop; platform_system != 'Windows'",
+    "aiofiles",
+    "orjson",
+    "httpx[http2]",
+    "pandas",
+    "structlog",
+]
+
+[project.optional-dependencies]
+extras = [
+    "torch",
+    "torchvision", 
+    "timm",
+    "Pillow",
+]
+
+[project.urls]
+Homepage = "https://github.com/trevorhobenshield/amazon_photos"
+Repository = "https://github.com/trevorhobenshield/amazon_photos"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=6.0",
+    "pytest-asyncio",
+    "black",
+    "isort",
+    "flake8",
+    "requests",
+    "structlog",
+] 
