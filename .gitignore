@@ -160,3 +160,6 @@ cython_debug/
 #.idea/
 
 # cookies.json
+cookies.json
+.DS_Store
+ap.parquet

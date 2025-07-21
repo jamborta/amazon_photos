@@ -57,8 +57,8 @@ class AmazonPhotos:
             'ContentType': 'JSON',
         }
         self.limits = kwargs.pop('limits', Limits(
-            max_connections=2000,
-            max_keepalive_connections=None,
+            max_connections=10,  # Much more conservative to avoid rate limiting
+            max_keepalive_connections=5,
             keepalive_expiry=5.0,
         ))
         self.client = Client(
@@ -75,9 +75,10 @@ class AmazonPhotos:
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.db_path = Path(db_path).expanduser()
         self.root = self.get_root()
-        self.folders = self.get_folders()
-        self.db = self.load_db(**kwargs)
-        self.tree = self.build_tree()
+        # Only initialize these if needed for uploads/folder operations
+        self.folders = None
+        self.db = None
+        self.tree = None
 
     def determine_tld(self, cookies: dict) -> str:
         """
@@ -128,7 +129,7 @@ class AmazonPhotos:
             kwargs.pop('headers', {}) | dict(self.client.headers),
             kwargs.pop('cookies', {}) | dict(self.client.cookies)
         )
-        sem = asyncio.Semaphore(max_connections or self.limits.max_connections)
+        sem = asyncio.Semaphore(max_connections or min(self.limits.max_connections, 5))
         async with AsyncClient(limits=self.limits, headers=headers, cookies=cookies, **defaults, **kwargs) as client:
             tasks = (fn(client=client, sem=sem) for fn in fns)
             if desc:
@@ -393,6 +394,7 @@ class AmazonPhotos:
         elif md5s:
             files = self.dedup_files(path, md5s, max_workers)
         else:
+            self._ensure_db()
             if 'md5' in self.db.columns:
                 files = self.dedup_files(path, set(self.db.md5), max_workers)
             else:
@@ -451,6 +453,7 @@ class AmazonPhotos:
         fns = (partial(get, node=node) for node in node_ids)
         asyncio.run(self.process(fns, desc='Downloading media', **kwargs))
         return {'timestamp': time.time_ns(), 'nodes': node_ids}
+    
 
     def trashed(self, filters: str = '', offset: int = 0, limit: int = MAX_LIMIT, sort: str = "['modifiedDate DESC']", **kwargs) -> list[dict]:
         """
@@ -932,45 +935,105 @@ class AmazonPhotos:
 
         @return: list of folders
         """
-        aclient = AsyncClient(
-            http2=False,
-            limits=self.limits,
-            headers=self.client.headers,
-            cookies=self.client.cookies,
-            verify=False,
-        )
-
-        async def helper(node):
+        logger.info("Fetching folders with conservative rate limiting...")
+        
+        async def helper(aclient, sem, node):
             url = f'{self.drive_url}/nodes/{node["id"]}/children'
             params = {'filters': 'kind:FOLDER'} | self.base_params
-            r = await aclient.get(url, params=params)
-            return r.json()['data']
+            # Add a small delay to be gentler on the API
+            await asyncio.sleep(0.2)  # Increased delay
+            
+            # Try multiple times with longer delays for 503 errors
+            for attempt in range(5):  # More aggressive retries
+                r = await self.async_backoff(aclient.get, sem, url, params=params, max_retries=15, m=30, b=3)
+                if r and r.status_code == 200:
+                    return r.json()['data']
+                elif r and r.status_code == 503:
+                    # 503 Service Unavailable - wait longer and retry
+                    wait_time = min(5 * (2 ** attempt), 60)  # Exponential backoff up to 60s
+                    logger.warning(f"503 error for node {node.get('id')}, waiting {wait_time}s before retry {attempt+1}/5")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    break
+            
+            logger.error(f"Failed to get folders for node {node.get('id')} after all retries: {r.status_code if r else 'No response'}")
+            return None  # Return None to indicate failure, not empty list
 
-        async def process_node(queue):
+        async def process_node(aclient, sem, queue):
             result = []
+            processed_nodes = set()
+            failed_nodes = []
             while True:
-                node = await queue.get()
-                if node.get('id'):
-                    subfolders = await helper(node)
-                    for folder in subfolders:
-                        await queue.put(folder)
-                    result.extend(subfolders)
-                queue.task_done()
-                if queue.empty():
-                    return result
+                try:
+                    node = await asyncio.wait_for(queue.get(), timeout=2.0)  # Increased timeout
+                    node_id = node.get('id')
+                    if node_id and node_id not in processed_nodes:
+                        processed_nodes.add(node_id)
+                        subfolders = await helper(aclient, sem, node)
+                        if subfolders is None:
+                            # Failed to fetch, add to failed list for potential retry
+                            failed_nodes.append(node)
+                            logger.warning(f"Failed to fetch subfolders for node {node_id}, will retry later")
+                        else:
+                            for folder in subfolders:
+                                if folder.get('id') not in processed_nodes:
+                                    await queue.put(folder)
+                            result.extend(subfolders)
+                    queue.task_done()
+                except asyncio.TimeoutError:
+                    # No more items in queue, we're done
+                    break
+                except Exception as e:
+                    logger.debug(f"Error processing node: {e}")
+                    queue.task_done()
+                    break
 
-        async def main(data, batch_size=self.n_threads):
-            Q = asyncio.Queue()
-            for node in data:
-                await Q.put(node)
-            tasks = [asyncio.create_task(process_node(Q)) for _ in range(batch_size)]
-            await Q.join()
-            for task in tasks:
-                task.cancel()
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            return [y for x in results if x for y in x]
+            logger.info(f"Processed {len(processed_nodes)} nodes, {len(failed_nodes)} failed")
+            
+            # Retry failed nodes one more time
+            if failed_nodes:
+                logger.info(f"Retrying {len(failed_nodes)} failed nodes...")
+                for node in failed_nodes:
+                    if node.get('id') not in processed_nodes:
+                        await asyncio.sleep(1.0)  # Extra delay before retry
+                        subfolders = await helper(aclient, sem, node)
+                        if subfolders is not None:
+                            result.extend(subfolders)
+                            logger.info(f"Successfully retried node {node.get('id')}")
+                        else:
+                            logger.error(f"Final failure for node {node.get('id')}")
+            
+            return result
+
+        async def main(data, batch_size=min(self.n_threads, 3)):  # Limit to max 3 workers
+            sem = asyncio.Semaphore(3)  # Even more conservative semaphore
+            async with AsyncClient(
+                http2=False,
+                limits=Limits(max_connections=3, max_keepalive_connections=2),  # Very conservative
+                headers=self.client.headers,
+                cookies=self.client.cookies,
+                verify=False,
+                timeout=30.0
+            ) as aclient:
+                Q = asyncio.Queue()
+                for node in data:
+                    await Q.put(node)
+                tasks = [asyncio.create_task(process_node(aclient, sem, Q)) for _ in range(batch_size)]
+                try:
+                    await asyncio.wait_for(Q.join(), timeout=600.0)  # 10 minute timeout
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                except asyncio.TimeoutError:
+                    logger.warning("Folder fetching timed out after 10 minutes")
+                    for task in tasks:
+                        task.cancel()
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                all_folders = [y for x in results if isinstance(x, list) for y in x]
+                logger.info(f"Successfully fetched {len(all_folders)} folders")
+                return all_folders
 
         folders = asyncio.run(main([{'id': self.root['id']}]))
+        logger.info(f"Total folders fetched: {len(folders)}")
         return folders
 
     def find_path(self, target: str, root: dict = None):
@@ -981,6 +1044,7 @@ class AmazonPhotos:
         @param root: optional root node to search from
         @return: node
         """
+        self._ensure_folders()
         if target == '':
             return self.tree
         root = root or self.tree
@@ -1028,6 +1092,8 @@ class AmazonPhotos:
         @param indent: optional indentation level
         @param prefix: optional prefix to add to output
         """
+        if node is None:
+            self._ensure_folders()
         node = node or self.tree
         conn = ('└── ' if last else '├── ') if node['name'] else ''
         name = node['name'] or '~'
@@ -1126,6 +1192,7 @@ class AmazonPhotos:
         return folder_map, res
 
     def refresh_db_aggressive(self, **kwargs) -> pd.DataFrame:
+        self._ensure_db()
         now = datetime.now()
         ap_yesterday = self.query(f'type:(PHOTOS OR VIDEOS) AND timeYear:({now.year}) AND timeMonth:({now.month}) AND timeDay:({now.day - 1})')
         ap_today = self.query(f'type:(PHOTOS OR VIDEOS) AND timeYear:({now.year}) AND timeMonth:({now.month}) AND timeDay:({now.day})')
@@ -1156,6 +1223,7 @@ class AmazonPhotos:
         else:
             db = self.nodes(filters=filters, **kwargs)
 
+        self._ensure_db()
         cols = set(db.columns) | set(self.db.columns)
 
         # disgusting
@@ -1280,3 +1348,13 @@ class AmazonPhotos:
         # todo: does not work, investigate later
         # self.client.cookies.update({'at-acb': at})
         return at
+
+    def _ensure_folders(self):
+        if self.folders is None:
+            self.folders = self.get_folders()
+        if self.tree is None:
+            self.tree = self.build_tree()
+
+    def _ensure_db(self):
+        if self.db is None:
+            self.db = self.load_db()

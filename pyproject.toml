@@ -63,4 +63,5 @@ dev-dependencies = [
     "flake8",
     "requests",
     "structlog",
+    "pyarrow",
 ] 
