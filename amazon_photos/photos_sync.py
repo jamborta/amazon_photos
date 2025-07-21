@@ -160,6 +160,7 @@ result = ap.download_with_folders(
     folder_report=folder_report,
     folders_cache_file=folders_cache_file,
     children_cache=children_cache,
+    FORCE_REFRESH_CACHE=FORCE_REFRESH_CACHE,
     DOWNLOAD_PHOTOS_DIR=DOWNLOAD_PHOTOS_DIR,
     DOWNLOAD_VIDEOS_DIR=DOWNLOAD_VIDEOS_DIR,
     out=DOWNLOAD_PHOTOS_DIR,
