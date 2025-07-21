@@ -15,7 +15,7 @@ from amazon_photos import AmazonPhotos
 
 # --- Configuration ---
 AMAZON_PHOTOS_BASE_URL = "https://www.amazon.co.uk"
-DOWNLOAD_DIR = "/Volumes/My Passport/amazon_photos_backup/Amazon Photos Downloads"
+DOWNLOAD_DIR = "/Volumes/My Passport/amazon_photos_backup/"
 
 # --- MONKEY PATCHING determine_tld (CRITICAL FIX) ---
 # This is not a logging hack; it's a necessary fix for a bug in the library.
@@ -70,7 +70,7 @@ logger.info("Starting download to: %s", os.path.abspath(DOWNLOAD_DIR))
 logger.info("Fetching list of all photos and videos from your Amazon Photos library...")
 
 try:
-    all_media = ap.photos()
+    all_media = ap.query('type:(PHOTOS OR VIDEOS)')  # Get both photos and videos
     logger.info("Finished fetching list. total_items_to_process=%s", len(all_media))
 except Exception as e:
     logger.error("Failed to fetch photos and videos: %s", str(e))
