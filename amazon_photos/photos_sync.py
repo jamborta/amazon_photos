@@ -29,7 +29,10 @@ import math
 import pandas as pd
 from collections import defaultdict
 
-folder_report = defaultdict(lambda: {"server": set(), "local": set()})
+folder_report = defaultdict(lambda: {
+    "photos": {"server": set(), "local": set()},
+    "videos": {"server": set(), "local": set()}
+})
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -214,6 +217,20 @@ def download_with_folders(self, media_df, out: str = 'media', chunk_size: int = 
         path_parts.reverse()
         return '/'.join(path_parts)
     
+    def get_file_type(row, is_live_photo_child=False):
+        """Determine if a file is a photo or video"""
+        if is_live_photo_child:
+            return "photos"  # Live Photo children always go to photos dir
+        ext = str(row.get('extension', '')).lower()
+        # Photo extensions
+        if ext in ("jpg", "jpeg", "png", "heic", "heif", "gif", "bmp", "tiff", "raw"):
+            return "photos"
+        # Video extensions
+        content_type = row.get('contentType', '').lower()
+        if ext in ("mp4", "mov", "avi", "qt") or content_type.startswith("video"):
+            return "videos"
+        return "photos"  # Default to photos for unknown types
+
     def get_download_dir(row, is_live_photo_child=False):
         # Live Photo child always goes to photos dir
         if is_live_photo_child:
@@ -235,7 +252,7 @@ def download_with_folders(self, media_df, out: str = 'media', chunk_size: int = 
         'ownerId': self.root['ownerId'],
     }
 
-    async def download_single_file(client, sem, node_id, expected_size, local_filepath, relative_path, parent_name):
+    async def download_single_file(client, sem, node_id, expected_size, local_filepath, relative_path):
 
         """Helper function to download a single file"""
         # Check if file already exists with correct size
@@ -285,8 +302,9 @@ def download_with_folders(self, media_df, out: str = 'media', chunk_size: int = 
             parent_id = row['parents'][0] if (isinstance(row['parents'], list) or isinstance(row['parents'], np.ndarray)) else row['parents']
             folder_path = get_folder_path(parent_id)
         
-        # Track server file for this folder
-        folder_report[folder_path]["server"].add(original_name)
+        # Determine file type and track server file for this folder
+        file_type = get_file_type(row)
+        folder_report[folder_path][file_type]["server"].add(original_name)
         # Determine main file download dir
         main_dir = get_download_dir(row)
         # Create local directory
@@ -300,11 +318,11 @@ def download_with_folders(self, media_df, out: str = 'media', chunk_size: int = 
         local_filepath = local_dir / original_name
         relative_path = f"{folder_path}/{original_name}" if folder_path else original_name
         
-        main_result = await download_single_file(client, sem, node_id, expected_size, local_filepath, relative_path, row["name"])
+        main_result = await download_single_file(client, sem, node_id, expected_size, local_filepath, relative_path)
         
         # Track local file for this folder (if it exists after download)
         if local_filepath.exists():
-            folder_report[folder_path]["local"].add(original_name)
+            folder_report[folder_path][file_type]["local"].add(original_name)
         # Check for Live Photo video component
         is_live_photo = False
         child_asset_info = row.get('childAssetTypeInfo', [])
@@ -349,11 +367,11 @@ def download_with_folders(self, media_df, out: str = 'media', chunk_size: int = 
                         video_local_dir = video_dir
                     video_filepath = video_local_dir / video_name
                     video_relative_path = f"{folder_path}/{video_name}" if folder_path else video_name
-                    video_result = await download_single_file(client, sem, child_id, child_size, video_filepath, video_relative_path, row["name"])
-                    # Track server and local for Live Photo child
-                    folder_report[folder_path]["server"].add(video_name)
+                    video_result = await download_single_file(client, sem, child_id, child_size, video_filepath, video_relative_path)
+                    # Track server and local for Live Photo child (always photos)
+                    folder_report[folder_path]["photos"]["server"].add(video_name)
                     if video_filepath.exists():
-                        folder_report[folder_path]["local"].add(video_name)
+                        folder_report[folder_path]["photos"]["local"].add(video_name)
                     if main_result == True and video_result == False:
                         logger.warning(f"Live Photo partially downloaded: {relative_path} (missing video component)")
         
@@ -397,16 +415,68 @@ except Exception as e:
     logger.warning(f"Failed to save children cache: {e}")
 
 # --- Folder Sync Report ---
-print("\n--- Folder Sync Report: Local files not on server ---")
-any_missing = False
-for folder, files in folder_report.items():
-    extra_local = files["local"] - files["server"]
-    if extra_local:
-        any_missing = True
-        print(f"\nFolder: {folder or '.'}")
-        for fname in sorted(extra_local):
-            print(f"  Local only: {fname}")
-if not any_missing:
+print("\n--- Folder Sync Report: Extra local files not on server ---")
+any_issues = False
+
+def get_file_type_from_extension(filename):
+    """Determine if a file is photo or video based on extension"""
+    ext = Path(filename).suffix.lower()
+    photo_exts = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".bmp", ".tiff", ".raw"}
+    video_exts = {".mp4", ".mov", ".avi", ".qt", ".m4v", ".3gp", ".flv", ".wmv"}
+    
+    if ext in photo_exts:
+        return "photos"
+    elif ext in video_exts:
+        return "videos"
+    return "photos"  # Default to photos for unknown types
+
+# Get all server files by folder and type
+server_files_by_folder = defaultdict(lambda: {"photos": set(), "videos": set()})
+for folder, file_types in folder_report.items():
+    server_files_by_folder[folder]["photos"] = file_types["photos"]["server"]
+    server_files_by_folder[folder]["videos"] = file_types["videos"]["server"]
+
+# Scan all local directories and compare with server
+for folder in server_files_by_folder.keys():
+    photos_dir = Path(DOWNLOAD_PHOTOS_DIR) / folder if folder else Path(DOWNLOAD_PHOTOS_DIR)
+    videos_dir = Path(DOWNLOAD_VIDEOS_DIR) / folder if folder else Path(DOWNLOAD_VIDEOS_DIR)
+    
+    local_photos = set()
+    local_videos = set()
+    
+    # Collect all local photos in this folder
+    if photos_dir.exists():
+        for file_path in photos_dir.rglob("*"):
+            if file_path.is_file():
+                filename = file_path.name
+                if get_file_type_from_extension(filename) == "photos":
+                    local_photos.add(filename)
+    
+    # Collect all local videos in this folder
+    if videos_dir.exists():
+        for file_path in videos_dir.rglob("*"):
+            if file_path.is_file():
+                filename = file_path.name
+                if get_file_type_from_extension(filename) == "videos":
+                    local_videos.add(filename)
+    
+    # Compare with server files
+    extra_photos = local_photos - server_files_by_folder[folder]["photos"]
+    extra_videos = local_videos - server_files_by_folder[folder]["videos"]
+    
+    if extra_photos:
+        any_issues = True
+        print(f"\nFolder: {folder or '.'} (Extra Photos)")
+        for fname in sorted(extra_photos):
+            print(f"  Extra photo: {fname}")
+    
+    if extra_videos:
+        any_issues = True
+        print(f"\nFolder: {folder or '.'} (Extra Videos)")
+        for fname in sorted(extra_videos):
+            print(f"  Extra video: {fname}")
+
+if not any_issues:
     print("All local files are present on the server (no extras found).")
 
 logger.info("\n--- Download Summary ---")
