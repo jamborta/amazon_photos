@@ -1837,17 +1837,16 @@ class AmazonPhotos:
             expected_size = row.get("size", 0)
 
             # Get folder path
-            folder_path = ""
+            folder_paths = []
             if "parents" in row and len(row["parents"]) > 0:
-                parent_id = (
-                    row["parents"][0]
-                    if (
-                        isinstance(row["parents"], list)
-                        or isinstance(row["parents"], np.ndarray)
-                    )
-                    else row["parents"]
-                )
-                folder_path = get_folder_path(parent_id)
+                for parent_id in row["parents"]: 
+                    folder_paths.append(get_folder_path(parent_id))
+
+            folder_paths = [f for f in folder_paths if f != ""]
+            if len(folder_paths) == 1:
+                folder_path = folder_paths[0]
+            else:
+                folder_path = ''
 
             # Determine file type and track server file for this folder
             file_type = get_file_type(row)

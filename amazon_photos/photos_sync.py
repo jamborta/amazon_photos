@@ -177,63 +177,77 @@ except Exception as e:
 # --- Folder Sync Report ---
 print("\n--- Folder Sync Report: Extra local files not on server ---")
 any_issues = False
+from pathlib import Path
 
 def get_file_type_from_extension(filename):
     """Determine if a file is photo or video based on extension"""
     ext = Path(filename).suffix.lower()
     photo_exts = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".bmp", ".tiff", ".raw"}
     video_exts = {".mp4", ".mov", ".avi", ".qt", ".m4v", ".3gp", ".flv", ".wmv"}
-    
-    if ext in photo_exts:
-        return "photos"
-    elif ext in video_exts:
-        return "videos"
-    return "photos"  # Default to photos for unknown types
+    if ext in photo_exts: return "photos"
+    elif ext in video_exts: return "videos"
+    return "photos"
 
-# Get all server files by folder and type
+# 1. Get all server files, organized by relative path
 server_files_by_folder = defaultdict(lambda: {"photos": set(), "videos": set()})
 for folder, file_types in folder_report.items():
-    server_files_by_folder[folder]["photos"] = file_types["photos"]["server"]
-    server_files_by_folder[folder]["videos"] = file_types["videos"]["server"]
+    server_files_by_folder[folder]["photos"].update(file_types["photos"]["server"])
+    server_files_by_folder[folder]["videos"].update(file_types["videos"]["server"])
 
-# Scan all local directories and compare with server
-for folder in server_files_by_folder.keys():
-    photos_dir = Path(DOWNLOAD_PHOTOS_DIR) / folder if folder else Path(DOWNLOAD_PHOTOS_DIR)
-    videos_dir = Path(DOWNLOAD_VIDEOS_DIR) / folder if folder else Path(DOWNLOAD_VIDEOS_DIR)
-    
-    local_photos = set()
-    local_videos = set()
-    
-    # Collect all local photos in this folder
-    if photos_dir.exists():
-        for file_path in photos_dir.rglob("*"):
-            if file_path.is_file():
-                filename = file_path.name
-                if get_file_type_from_extension(filename) == "photos":
-                    local_photos.add(filename)
-    
-    # Collect all local videos in this folder
-    if videos_dir.exists():
-        for file_path in videos_dir.rglob("*"):
-            if file_path.is_file():
-                filename = file_path.name
-                if get_file_type_from_extension(filename) == "videos":
-                    local_videos.add(filename)
-    
-    # Compare with server files
-    extra_photos = local_photos - server_files_by_folder[folder]["photos"]
-    extra_videos = local_videos - server_files_by_folder[folder]["videos"]
+# 2. Get all local files, organized by relative path
+local_files_by_folder = defaultdict(lambda: {"photos": set(), "videos": set()})
+photos_root = Path(DOWNLOAD_PHOTOS_DIR)
+videos_root = Path(DOWNLOAD_VIDEOS_DIR)
+
+# Scan photos directory
+if photos_root.exists():
+    for file_path in photos_root.rglob("*"):
+        if file_path.is_file():
+            rel_path_parts = file_path.relative_to(photos_root).parts
+            folder_path = "/".join(rel_path_parts[:-1]) # The folder path is everything but the filename
+            filename = rel_path_parts[-1]
+            if filename == '.DS_Store':
+                continue
+            if get_file_type_from_extension(filename) == "photos":
+                local_files_by_folder[folder_path]["photos"].add(filename)
+
+# Scan videos directory
+if videos_root.exists():
+    for file_path in videos_root.rglob("*"):
+        if file_path.is_file():
+            rel_path_parts = file_path.relative_to(videos_root).parts
+            folder_path = "/".join(rel_path_parts[:-1])
+            filename = rel_path_parts[-1]
+            if filename == '.DS_Store':
+                continue
+            if get_file_type_from_extension(filename) == "videos":
+                local_files_by_folder[folder_path]["videos"].add(filename)
+
+# 3. Combine folder keys from both local and server to ensure we check everything
+all_folders_to_check = sorted(list(set(server_files_by_folder.keys()) | set(local_files_by_folder.keys())))
+
+# 4. Compare and report
+for folder in all_folders_to_check:
+    local_photos = local_files_by_folder[folder]["photos"]
+    server_photos = server_files_by_folder[folder]["photos"]
+    extra_photos = local_photos - server_photos
+
+    local_videos = local_files_by_folder[folder]["videos"]
+    server_videos = server_files_by_folder[folder]["videos"]
+    extra_videos = local_videos - server_videos
+
+    folder_display = "Root" if not folder else folder
     
     if extra_photos:
         any_issues = True
-        print(f"\nFolder: {folder or '.'} (Extra Photos)")
-        for fname in sorted(extra_photos):
+        print(f"\nFolder: {folder_display} (Extra Photos)")
+        for fname in sorted(list(extra_photos)):
             print(f"  Extra photo: {fname}")
-    
+
     if extra_videos:
         any_issues = True
-        print(f"\nFolder: {folder or '.'} (Extra Videos)")
-        for fname in sorted(extra_videos):
+        print(f"\nFolder: {folder_display} (Extra Videos)")
+        for fname in sorted(list(extra_videos)):
             print(f"  Extra video: {fname}")
 
 if not any_issues:
