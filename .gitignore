@@ -163,3 +163,7 @@ cython_debug/
 cookies.json
 .DS_Store
 ap.parquet
+amazon_photos_media_cache.parquet
+amazon_photos_children_cache.json
+.gitignore
+amazon_photos_folders_cache.json
