@@ -116,33 +116,14 @@ def download_with_folders(self, media_df, out: str = 'media', chunk_size: int = 
         'ownerId': self.root['ownerId'],
     }
 
-    async def get(client, sem, row):
-        node_id = row['id']
-        original_name = row.get('name', f"{node_id}.jpg")
-        expected_size = row.get('size', 0)  # Get expected file size
-        
-        # Get folder path
-        folder_path = ""
-        if 'parents' in row and row['parents'] and len(row['parents']) > 0:
-            parent_id = row['parents'][0] if isinstance(row['parents'], list) else row['parents']
-            folder_path = get_folder_path(parent_id)
-        
-        # Create local path
-        if folder_path:
-            local_dir = out / folder_path
-            local_dir.mkdir(parents=True, exist_ok=True)
-            local_filepath = local_dir / original_name
-        else:
-            local_filepath = out / original_name
-        
-        relative_path = f"{folder_path}/{original_name}" if folder_path else original_name
-        
+    async def download_single_file(client, sem, node_id, filename, expected_size, local_filepath, relative_path):
+        """Helper function to download a single file"""
         # Check if file already exists with correct size
         if local_filepath.exists():
             existing_size = local_filepath.stat().st_size
             if expected_size > 0 and existing_size == expected_size:
                 logger.debug(f"SKIPPED (already exists): {relative_path} ({existing_size:,} bytes)")
-                return "skipped"  # Return different value for skipped files
+                return "skipped"
             elif expected_size > 0:
                 logger.info(f"RE-DOWNLOADING (size mismatch): {relative_path} - Expected: {expected_size:,}, Found: {existing_size:,}")
             else:
@@ -152,7 +133,6 @@ def download_with_folders(self, media_df, out: str = 'media', chunk_size: int = 
         try:
             async with sem:
                 url = f'{self.drive_url}/nodes/{node_id}/contentRedirection'
-                # Note: 302 redirects are normal - contentRedirection redirects to actual download URL
                 async with client.stream('GET', url, params=params) as r:
                     r.raise_for_status()
                     import aiofiles
@@ -173,6 +153,78 @@ def download_with_folders(self, media_df, out: str = 'media', chunk_size: int = 
         except Exception as e:
             logger.error(f'Download FAILED for {node_id}: {e}')
             return False
+
+    async def get(client, sem, row):
+        node_id = row['id']
+        original_name = row.get('name', f"{node_id}.jpg")
+        expected_size = row.get('size', 0)
+        
+        # Get folder path
+        folder_path = ""
+        if 'parents' in row and row['parents'] and len(row['parents']) > 0:
+            parent_id = row['parents'][0] if isinstance(row['parents'], list) else row['parents']
+            folder_path = get_folder_path(parent_id)
+        
+        # Create local directory
+        if folder_path:
+            local_dir = out / folder_path
+            local_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            local_dir = out
+        
+        # Download main file
+        local_filepath = local_dir / original_name
+        relative_path = f"{folder_path}/{original_name}" if folder_path else original_name
+        
+        main_result = await download_single_file(client, sem, node_id, original_name, expected_size, local_filepath, relative_path)
+        
+        # Check for Live Photo video component
+        is_live_photo = False
+        child_asset_info = row.get('childAssetTypeInfo', [])
+        if child_asset_info and isinstance(child_asset_info, list):
+            for asset_info in child_asset_info:
+                if isinstance(asset_info, dict) and asset_info.get('assetType') == 'LIVE_VIDEO':
+                    is_live_photo = True
+                    break
+        
+        if is_live_photo:
+            try:
+                # Get child assets for Live Photo
+                async with sem:
+                    children_url = f'{self.drive_url}/nodes/{node_id}/children'
+                    children_params = self.base_params
+                    r = await client.get(children_url, params=children_params)
+                    r.raise_for_status()
+                    children_data = r.json()
+                    
+                    for child in children_data.get('data', []):
+                        # Live Photo video components have kind='ASSET' and assetType='LIVE_VIDEO'
+                        if (child.get('kind') == 'ASSET' and 
+                            child.get('assetProperties', {}).get('assetType') == 'LIVE_VIDEO'):
+                            
+                            child_id = child['id']
+                            child_size = child.get('contentProperties', {}).get('size', 0)
+                            child_extension = child.get('contentProperties', {}).get('extension', 'qt')
+                            
+                            # Create video filename (Apple convention: photo.heic -> photo.heic.qt)
+                            if original_name.lower().endswith('.heic'):
+                                video_name = f"{original_name}.{child_extension}"
+                            else:
+                                video_name = f"{original_name}.{child_extension}"
+                            
+                            video_filepath = local_dir / video_name
+                            video_relative_path = f"{folder_path}/{video_name}" if folder_path else video_name
+                            
+                            video_result = await download_single_file(client, sem, child_id, video_name, child_size, video_filepath, video_relative_path)
+                            
+                            # If main file succeeded but video failed, still count as partial success
+                            if main_result == True and video_result == False:
+                                logger.warning(f"Live Photo partially downloaded: {relative_path} (missing video component)")
+                                
+            except Exception as e:
+                logger.error(f'Failed to get Live Photo video component for {node_id}: {e}')
+        
+        return main_result
 
     # Convert DataFrame to list of dicts for easier processing
     media_list = [row for _, row in media_df.iterrows()]
